@@ -52,18 +52,21 @@ def updateData(DeviceModel):
 
 
 if __name__ == '__main__':
-    # 方式一：广播搜索和连接蓝牙设备
-    # Method 1:Broadcast search and connect Bluetooth devices
-    asyncio.run(scan())
+    async def main():
+        # 方式一：广播搜索和连接蓝牙设备
+        # Method 1: Broadcast search and connect Bluetooth devices
+        await scan()
 
-    # # 方式二：指定MAC地址搜索并连接设备
-    # # Method 2: Specify MAC address to search and connect devices
-    # asyncio.run(scanByMac("C6:46:21:41:0B:BD"))
+        # # 方式二：指定MAC地址搜索并连接设备
+        # # Method 2: Specify MAC address to search and connect devices
+        # await scanByMac("C6:46:21:41:0B:BD")
 
-    if BLEDevice is not None:
-        # 创建设备 Create device
-        device = device_model.DeviceModel("MyBle5.0", BLEDevice, updateData)
-        # 开始连接设备 Start connecting devices
-        asyncio.run(device.openDevice())
-    else:
-        print("This BLEDevice was not found!!")
+        if BLEDevice is not None:
+            # 创建设备 Create device
+            device = device_model.DeviceModel("MyBle5.0", BLEDevice, updateData)
+            # 开始连接设备 Start connecting devices
+            await device.openDevice()
+        else:
+            print("This BLEDevice was not found!!")
+
+    asyncio.run(main())

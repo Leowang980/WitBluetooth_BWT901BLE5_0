@@ -84,7 +84,7 @@ class DeviceModel:
             if self.writer_characteristic:
                 # 读取磁场四元数 Reading magnetic field quaternions
                 print("Reading magnetic field quaternions")
-                time.sleep(3)
+                await asyncio.sleep(3)
                 asyncio.create_task(self.sendDataTh())
 
             if notify_characteristic:
@@ -112,9 +112,9 @@ class DeviceModel:
     async def sendDataTh(self):
         while self.isOpen:
             await self.readReg(0x3A)
-            time.sleep(0.1)
+            await asyncio.sleep(0.1)
             await self.readReg(0x51)
-            time.sleep(0.1)
+            await asyncio.sleep(0.1)
 
     # region 数据解析 data analysis
     # 串口数据处理  Serial port data processing
@@ -201,15 +201,15 @@ class DeviceModel:
     # 写入寄存器 Write Register
     async def writeReg(self, regAddr, sValue):
         # 解锁 unlock
-        self.unlock()
+        await self.unlock()
         # 延迟100ms Delay 100ms
-        time.sleep(0.1)
+        await asyncio.sleep(0.1)
         # 封装写入指令并向串口发送数据
         await self.sendData(self.get_writeBytes(regAddr, sValue))
         # 延迟100ms Delay 100ms
-        time.sleep(0.1)
+        await asyncio.sleep(0.1)
         # 保存 save
-        self.save()
+        await self.save()
 
     # 读取指令封装 Read instruction encapsulation
     @staticmethod
@@ -236,11 +236,11 @@ class DeviceModel:
         return tempBytes
 
     # 解锁 unlock
-    def unlock(self):
+    async def unlock(self):
         cmd = self.get_writeBytes(0x69, 0xb588)
-        self.sendData(cmd)
+        await self.sendData(cmd)
 
     # 保存 save
-    def save(self):
+    async def save(self):
         cmd = self.get_writeBytes(0x00, 0x0000)
-        self.sendData(cmd)
+        await self.sendData(cmd)
