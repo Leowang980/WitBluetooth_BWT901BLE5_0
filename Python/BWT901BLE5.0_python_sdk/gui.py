@@ -44,9 +44,13 @@ DATA_GROUPS = {
 
 class ImuDeadReckoner:
     GRAVITY = 9.80665
-    ACC_DEADBAND_G = 0.025
-    STATIC_ACCEL_G = 0.08
-    STATIC_GYRO_DPS = 3.0
+    CALIBRATION_FRAMES = 80
+    MIN_ACC_DEADBAND_G = 0.018
+    MAX_ACC_DEADBAND_G = 0.16
+    MIN_STATIC_ACCEL_G = 0.05
+    MAX_STATIC_ACCEL_G = 0.24
+    MIN_STATIC_GYRO_DPS = 2.0
+    MAX_STATIC_GYRO_DPS = 12.0
 
     def __init__(self):
         self.reset()
@@ -61,8 +65,15 @@ class ImuDeadReckoner:
         self.gravity_reference_g = None
         self.static_frames = 0
         self.is_stationary = False
-        self.calibration_frames = 30
+        self.calibration_frames = self.CALIBRATION_FRAMES
         self.calibration_sum_g = [0.0, 0.0, 0.0]
+        self.calibration_samples = []
+        self.calibration_gyro_norms = []
+        self.acc_deadband_g = self.MIN_ACC_DEADBAND_G
+        self.static_accel_g = self.MIN_STATIC_ACCEL_G
+        self.static_gyro_dps = self.MIN_STATIC_GYRO_DPS
+        self.last_acc_world_g = None
+        self.force_stationary = False
 
     @staticmethod
     def _euler_body_to_world(vector, roll, pitch, yaw):
@@ -123,21 +134,28 @@ class ImuDeadReckoner:
             self.gravity_reference_g = list(acc_world_g)
 
         if self.calibration_frames > 0:
+            gyro_norm = math.sqrt(sum(float(data.get(key, 0.0)) ** 2 for key in ("AsX", "AsY", "AsZ")))
+            self.calibration_samples.append(tuple(acc_world_g))
+            self.calibration_gyro_norms.append(gyro_norm)
             for index in range(3):
                 self.calibration_sum_g[index] += acc_world_g[index]
-                sample_count = 31 - self.calibration_frames
+                sample_count = self.CALIBRATION_FRAMES + 1 - self.calibration_frames
                 self.gravity_reference_g[index] = self.calibration_sum_g[index] / sample_count
             self.calibration_frames -= 1
+            if self.calibration_frames == 0:
+                self._finish_calibration()
             self.is_stationary = True
             self.velocity = [0.0, 0.0, 0.0]
             self.linear_accel = [0.0, 0.0, 0.0]
+            self.last_acc_world_g = list(acc_world_g)
             return self.snapshot()
 
         if previous_time is None:
             return self.snapshot()
 
         dt = timestamp - previous_time
-        if dt <= 0:
+        if dt <= 0 or dt > 0.35:
+            self.last_acc_world_g = list(acc_world_g)
             return self.snapshot()
         dt = min(dt, 0.08)
 
@@ -147,31 +165,77 @@ class ImuDeadReckoner:
         ]
         gyro_norm = math.sqrt(sum(float(data.get(key, 0.0)) ** 2 for key in ("AsX", "AsY", "AsZ")))
         accel_norm = math.sqrt(sum(value * value for value in linear_g))
-        maybe_stationary = accel_norm < self.STATIC_ACCEL_G and gyro_norm < self.STATIC_GYRO_DPS
+        jerk_g = 0.0
+        if self.last_acc_world_g is not None:
+            jerk_g = math.sqrt(sum((acc_world_g[index] - self.last_acc_world_g[index]) ** 2 for index in range(3)))
+        self.last_acc_world_g = list(acc_world_g)
+
+        maybe_stationary = self.force_stationary or (
+            accel_norm < self.static_accel_g
+            and gyro_norm < self.static_gyro_dps
+            and jerk_g < self.static_accel_g * 1.8
+        )
         if maybe_stationary:
             self.static_frames += 1
         else:
             self.static_frames = 0
-        self.is_stationary = self.static_frames >= 5
+        self.is_stationary = self.static_frames >= 4
 
         if self.is_stationary:
             for index in range(3):
-                self.gravity_reference_g[index] = self.gravity_reference_g[index] * 0.96 + acc_world_g[index] * 0.04
+                self.gravity_reference_g[index] = self.gravity_reference_g[index] * 0.985 + acc_world_g[index] * 0.015
             linear_g = [0.0, 0.0, 0.0]
             self.velocity = [0.0, 0.0, 0.0]
+            self.path.append(tuple(self.position))
+            self.linear_accel = [0.0, 0.0, 0.0]
+            return self.snapshot()
         else:
-            linear_g = [
-                0.0 if abs(value) < self.ACC_DEADBAND_G else value
-                for value in linear_g
-            ]
+            linear_g = [self._soft_deadband(value, self.acc_deadband_g) for value in linear_g]
 
-        self.linear_accel = [value * self.GRAVITY for value in linear_g]
+        self.linear_accel = [
+            max(min(value * self.GRAVITY, 25.0), -25.0)
+            for value in linear_g
+        ]
         for index in range(3):
             self.position[index] += self.velocity[index] * dt + 0.5 * self.linear_accel[index] * dt * dt
             self.velocity[index] += self.linear_accel[index] * dt
-            self.velocity[index] *= 0.996
+            self.velocity[index] *= math.exp(-dt / 3.5)
+            if abs(self.velocity[index]) < 0.006 and accel_norm < self.static_accel_g * 1.4:
+                self.velocity[index] = 0.0
         self.path.append(tuple(self.position))
         return self.snapshot()
+
+    def _finish_calibration(self):
+        if not self.calibration_samples:
+            return
+
+        mean_g = [
+            sum(sample[index] for sample in self.calibration_samples) / len(self.calibration_samples)
+            for index in range(3)
+        ]
+        residuals = [
+            math.sqrt(sum((sample[index] - mean_g[index]) ** 2 for index in range(3)))
+            for sample in self.calibration_samples
+        ]
+        mean_residual = sum(residuals) / len(residuals)
+        variance = sum((value - mean_residual) ** 2 for value in residuals) / max(len(residuals), 1)
+        accel_noise_g = math.sqrt(variance) + mean_residual
+
+        gyro_mean = sum(self.calibration_gyro_norms) / max(len(self.calibration_gyro_norms), 1)
+        gyro_var = sum((value - gyro_mean) ** 2 for value in self.calibration_gyro_norms) / max(len(self.calibration_gyro_norms), 1)
+        gyro_noise = math.sqrt(gyro_var) + gyro_mean
+
+        self.gravity_reference_g = mean_g
+        self.acc_deadband_g = min(max(accel_noise_g * 3.0 + 0.006, self.MIN_ACC_DEADBAND_G), self.MAX_ACC_DEADBAND_G)
+        self.static_accel_g = min(max(accel_noise_g * 7.0 + 0.018, self.MIN_STATIC_ACCEL_G), self.MAX_STATIC_ACCEL_G)
+        self.static_gyro_dps = min(max(gyro_noise * 4.0 + 0.8, self.MIN_STATIC_GYRO_DPS), self.MAX_STATIC_GYRO_DPS)
+
+    @staticmethod
+    def _soft_deadband(value, deadband):
+        magnitude = abs(value)
+        if magnitude <= deadband:
+            return 0.0
+        return math.copysign((magnitude - deadband) * 0.72, value)
 
     def snapshot(self):
         drift = math.sqrt(sum(value * value for value in self.position))
@@ -187,6 +251,10 @@ class ImuDeadReckoner:
             "accel_norm": accel_norm,
             "stationary": self.is_stationary,
             "calibrating": self.calibration_frames > 0,
+            "acc_deadband_g": self.acc_deadband_g,
+            "static_accel_g": self.static_accel_g,
+            "static_gyro_dps": self.static_gyro_dps,
+            "force_stationary": self.force_stationary,
         }
 
 
@@ -687,6 +755,10 @@ class Trajectory3DView(tk.Canvas):
             "accel_norm": 0.0,
             "stationary": False,
             "calibrating": False,
+            "acc_deadband_g": 0.0,
+            "static_accel_g": 0.0,
+            "static_gyro_dps": 0.0,
+            "force_stationary": False,
         }
         path = state["path"]
         max_extent = 0.15
@@ -723,7 +795,10 @@ class Trajectory3DView(tk.Canvas):
         px, py, pz = state["position"]
         marker = self._view_project((px, py, pz), cx, cy, scale)
         self.create_oval(marker[0] - 7, marker[1] - 7, marker[0] + 7, marker[1] + 7, fill=COLORS["warning"], outline="")
-        if state["calibrating"]:
+        if state["force_stationary"]:
+            state_label = "强制静止"
+            state_color = COLORS["accent_2"]
+        elif state["calibrating"]:
             state_label = "校准中"
             state_color = COLORS["accent"]
         elif state["stationary"]:
@@ -744,7 +819,7 @@ class Trajectory3DView(tk.Canvas):
         self.create_text(
             18,
             height - 24,
-            text=f"漂移 |p| {state['drift']:.3f} m    速度 |v| {state['speed']:.3f} m/s    线加速度 {state['accel_norm']:.3f} m/s²",
+            text=f"漂移 |p| {state['drift']:.3f} m    速度 |v| {state['speed']:.3f} m/s    线加速度 {state['accel_norm']:.3f} m/s²    阈值 {state['static_accel_g']:.3f}g/{state['static_gyro_dps']:.1f}dps",
             fill=COLORS["muted"],
             anchor="w",
             font=("Helvetica Neue", 11),
@@ -825,6 +900,8 @@ class WitBleDashboard(tk.Tk):
         style.map("Danger.TButton", background=[("active", "#fda4af"), ("disabled", "#334155")])
         style.configure("Compact.TButton", background=COLORS["panel_2"], foreground=COLORS["text"], borderwidth=0, padding=(12, 7), font=("Helvetica Neue", 11, "bold"))
         style.map("Compact.TButton", background=[("active", "#263244")])
+        style.configure("Lock.TCheckbutton", background=COLORS["panel"], foreground=COLORS["text"], font=("Helvetica Neue", 11, "bold"))
+        style.map("Lock.TCheckbutton", background=[("active", COLORS["panel"])], foreground=[("selected", COLORS["accent_2"])])
         style.configure("Treeview", background=COLORS["panel"], foreground=COLORS["text"], fieldbackground=COLORS["panel"], borderwidth=0, rowheight=32)
         style.configure("Treeview.Heading", background=COLORS["panel_2"], foreground=COLORS["muted"], relief="flat", font=("Helvetica Neue", 11, "bold"))
         style.map("Treeview", background=[("selected", "#0e7490")], foreground=[("selected", "#ecfeff")])
@@ -864,19 +941,28 @@ class WitBleDashboard(tk.Tk):
         self.reset_imu_button = ttk.Button(sidebar, text="重置/校准6DoF", style="Secondary.TButton", command=self._reset_dead_reckoning)
         self.reset_imu_button.grid(row=4, column=0, sticky="ew", padx=16, pady=(0, 14))
 
+        self.force_stationary_var = tk.BooleanVar(value=False)
+        self.force_stationary_check = ttk.Checkbutton(
+            sidebar,
+            text="强制静止锁定",
+            variable=self.force_stationary_var,
+            style="Lock.TCheckbutton",
+        )
+        self.force_stationary_check.grid(row=5, column=0, sticky="w", padx=16, pady=(0, 14))
+
         columns = ("name", "address")
         self.device_tree = ttk.Treeview(sidebar, columns=columns, show="headings", height=9)
         self.device_tree.heading("name", text="名称")
         self.device_tree.heading("address", text="地址 / UUID")
         self.device_tree.column("name", width=120, minwidth=90, stretch=False)
         self.device_tree.column("address", width=190, minwidth=170, stretch=True)
-        self.device_tree.grid(row=5, column=0, sticky="nsew", padx=16, pady=(0, 14))
-        sidebar.rowconfigure(5, weight=1)
+        self.device_tree.grid(row=6, column=0, sticky="nsew", padx=16, pady=(0, 14))
+        sidebar.rowconfigure(6, weight=1)
 
-        ttk.Label(sidebar, text="提示：macOS 上显示的通常是 UUID，直接选择扫描到的那一项即可。", style="Muted.TLabel", wraplength=286).grid(row=6, column=0, sticky="ew", padx=16, pady=(0, 16))
+        ttk.Label(sidebar, text="提示：静止测试时可打开强制静止锁定；移动前请关闭。macOS 上显示的通常是 UUID。", style="Muted.TLabel", wraplength=286).grid(row=7, column=0, sticky="ew", padx=16, pady=(0, 16))
 
         self.orientation = OrientationView(sidebar, height=250)
-        self.orientation.grid(row=7, column=0, sticky="ew", padx=16, pady=(0, 16))
+        self.orientation.grid(row=8, column=0, sticky="ew", padx=16, pady=(0, 16))
 
         content = ttk.Frame(root, style="TFrame")
         content.grid(row=0, column=1, sticky="nsew")
@@ -973,6 +1059,7 @@ class WitBleDashboard(tk.Tk):
 
     def _reset_dead_reckoning(self):
         self.dead_reckoner.reset()
+        self.dead_reckoner.force_stationary = self.force_stationary_var.get()
         self.latest_data.update({
             "PosX": 0.0,
             "PosY": 0.0,
@@ -1045,6 +1132,7 @@ class WitBleDashboard(tk.Tk):
         self.latest_data.update(data)
         self.last_packet_time = time.time()
         self.status_label.configure(text="已连接，正在接收数据")
+        self.dead_reckoner.force_stationary = self.force_stationary_var.get()
         inertial_state = self.dead_reckoner.update(self.latest_data, self.last_packet_time)
         position = inertial_state["position"]
         velocity = inertial_state["velocity"]
