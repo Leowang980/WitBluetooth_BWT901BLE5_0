@@ -5,6 +5,7 @@ import queue
 import threading
 import time
 import tkinter as tk
+from collections import deque
 from tkinter import messagebox, ttk
 
 import bleak
@@ -26,6 +27,37 @@ COLORS = {
     "y": "#34d399",
     "z": "#f472b6",
 }
+
+
+ANGLE_KEYS = ("AngX", "AngY", "AngZ")
+STABILITY_WINDOW_SECONDS = 1.5
+MIN_STABILITY_SAMPLES = 12
+STABILITY_LIMITS = {
+    "AngX": 2.0,
+    "AngY": 2.0,
+    "AngZ": 4.0,
+}
+AXIS_LABELS = {
+    "AngX": ("X 方向夹角", COLORS["x"]),
+    "AngY": ("Y 方向夹角", COLORS["y"]),
+    "AngZ": ("Z 方向夹角", COLORS["z"]),
+}
+
+
+def normalize_angle(angle):
+    while angle > 180:
+        angle -= 360
+    while angle < -180:
+        angle += 360
+    return angle
+
+
+def circular_mean(values):
+    if not values:
+        return 0.0
+    sin_sum = sum(math.sin(math.radians(value)) for value in values)
+    cos_sum = sum(math.cos(math.radians(value)) for value in values)
+    return math.degrees(math.atan2(sin_sum, cos_sum))
 
 
 class DualBleWorker:
@@ -258,18 +290,71 @@ class OrientationCube(tk.Canvas):
             self.create_text(x, y + 30, text=f"{value:8.2f}°", fill=color, font=("Helvetica Neue", 22, "bold"))
 
 
+class AngleGauge(tk.Canvas):
+    def __init__(self, parent, title, color, **kwargs):
+        super().__init__(
+            parent,
+            bg=COLORS["panel"],
+            highlightthickness=1,
+            highlightbackground=COLORS["border"],
+            **kwargs,
+        )
+        self.title = title
+        self.color = color
+        self.angle = 0.0
+        self.calibrated = False
+        self.bind("<Configure>", lambda _event: self.draw())
+
+    def update_angle(self, angle, calibrated):
+        self.angle = angle
+        self.calibrated = calibrated
+        self.draw()
+
+    def draw(self):
+        self.delete("all")
+        width = max(self.winfo_width(), 260)
+        height = max(self.winfo_height(), 150)
+        self.create_rectangle(0, 0, width, height, fill=COLORS["panel"], outline="")
+        self.create_text(18, 18, text=self.title, fill=COLORS["muted"], anchor="w", font=("Helvetica Neue", 12, "bold"))
+
+        display = self.angle if self.calibrated else 0.0
+        text = f"{display:+7.2f}°" if self.calibrated else "--"
+        self.create_text(width / 2, 56, text=text, fill=self.color, font=("Helvetica Neue", 30, "bold"))
+
+        bar_x0, bar_y0 = 24, 100
+        bar_x1 = width - 24
+        bar_h = 14
+        self.create_rectangle(bar_x0, bar_y0, bar_x1, bar_y0 + bar_h, fill=COLORS["panel_2"], outline=COLORS["border"])
+        center = (bar_x0 + bar_x1) / 2
+        self.create_line(center, bar_y0 - 8, center, bar_y0 + bar_h + 8, fill=COLORS["muted"])
+        if self.calibrated:
+            clamped = max(min(display, 90.0), -90.0)
+            marker = center + (clamped / 90.0) * ((bar_x1 - bar_x0) / 2)
+            self.create_rectangle(min(center, marker), bar_y0, max(center, marker), bar_y0 + bar_h, fill=self.color, outline="")
+            self.create_oval(marker - 7, bar_y0 - 4, marker + 7, bar_y0 + bar_h + 4, fill=self.color, outline="")
+        self.create_text(bar_x0, bar_y0 + 34, text="-90°", fill=COLORS["muted"], anchor="w", font=("Helvetica Neue", 10))
+        self.create_text(center, bar_y0 + 34, text="0°", fill=COLORS["muted"], font=("Helvetica Neue", 10))
+        self.create_text(bar_x1, bar_y0 + 34, text="+90°", fill=COLORS["muted"], anchor="e", font=("Helvetica Neue", 10))
+
+
 class DualImuDashboard(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("双 IMU 3DoF 姿态显示")
-        self.geometry("1320x780")
-        self.minsize(1120, 680)
+        self.geometry("1320x900")
+        self.minsize(1120, 760)
         self.configure(bg=COLORS["bg"])
 
         self.event_queue = queue.Queue()
         self.worker = DualBleWorker(self.event_queue)
         self.devices = []
         self.connected_names = {"A": None, "B": None}
+        self.latest_angles = {"A": None, "B": None}
+        self.angle_history = {"A": deque(maxlen=60), "B": deque(maxlen=60)}
+        self.calibrated = False
+        self.calibration_pending = False
+        self.calibration_offsets = {key: 0.0 for key in ANGLE_KEYS}
+        self.relative_angles = {key: 0.0 for key in ANGLE_KEYS}
 
         self._setup_style()
         self._build_layout()
@@ -294,6 +379,8 @@ class DualImuDashboard(tk.Tk):
         style.map("Secondary.TButton", background=[("active", "#334155"), ("disabled", "#1f2937")])
         style.configure("Danger.TButton", background=COLORS["danger"], foreground="#fff1f2", borderwidth=0, padding=(14, 10), font=("Helvetica Neue", 12, "bold"))
         style.map("Danger.TButton", background=[("active", "#fda4af"), ("disabled", "#334155")])
+        style.configure("Calibrate.TButton", background=COLORS["accent_2"], foreground="#052e16", borderwidth=0, padding=(14, 10), font=("Helvetica Neue", 12, "bold"))
+        style.map("Calibrate.TButton", background=[("active", "#86efac"), ("disabled", "#334155")], foreground=[("disabled", "#94a3b8")])
         style.configure("Treeview", background=COLORS["panel"], foreground=COLORS["text"], fieldbackground=COLORS["panel"], borderwidth=0, rowheight=34)
         style.configure("Treeview.Heading", background=COLORS["panel_2"], foreground=COLORS["muted"], relief="flat", font=("Helvetica Neue", 11, "bold"))
         style.map("Treeview", background=[("selected", "#0e7490")], foreground=[("selected", "#ecfeff")])
@@ -344,18 +431,24 @@ class DualImuDashboard(tk.Tk):
         ttk.Button(disconnect_grid, text="断开 A", style="Danger.TButton", command=lambda: self._disconnect("A")).grid(row=0, column=0, sticky="ew", padx=(0, 8))
         ttk.Button(disconnect_grid, text="断开 B", style="Danger.TButton", command=lambda: self._disconnect("B")).grid(row=0, column=1, sticky="ew")
 
+        self.calibrate_button = ttk.Button(sidebar, text="等待稳定并校准", style="Calibrate.TButton", command=self._request_calibration)
+        self.calibrate_button.grid(row=6, column=0, sticky="ew", padx=16, pady=(0, 10))
+        self.calibration_label = ttk.Label(sidebar, text="校准状态：等待两个 IMU 连接", style="Muted.TLabel", wraplength=310)
+        self.calibration_label.grid(row=7, column=0, sticky="ew", padx=16, pady=(0, 16))
+
         ttk.Label(
             sidebar,
-            text="用法：先扫描，选中一个设备后点“连接到 A”；再选中另一个设备点“连接到 B”。macOS 上地址通常是 UUID。",
+            text="用法：先连接 A/B，保持两个 IMU 静止，点击“等待稳定并校准”。校准后下方显示 B 相对 A 的三个方向夹角。",
             style="Muted.TLabel",
             wraplength=310,
-        ).grid(row=6, column=0, sticky="ew", padx=16, pady=(0, 18))
+        ).grid(row=8, column=0, sticky="ew", padx=16, pady=(0, 18))
 
         main = ttk.Frame(root, style="Root.TFrame")
         main.grid(row=0, column=1, sticky="nsew")
         main.columnconfigure(0, weight=1)
         main.columnconfigure(1, weight=1)
         main.rowconfigure(0, weight=1)
+        main.rowconfigure(1, weight=0)
 
         self.cubes = {
             "A": OrientationCube(main, "A"),
@@ -363,6 +456,17 @@ class DualImuDashboard(tk.Tk):
         }
         self.cubes["A"].grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         self.cubes["B"].grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+
+        gauge_panel = ttk.Frame(main, style="Root.TFrame")
+        gauge_panel.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(16, 0))
+        for index in range(3):
+            gauge_panel.columnconfigure(index, weight=1)
+        self.gauges = {}
+        for index, key in enumerate(ANGLE_KEYS):
+            title, color = AXIS_LABELS[key]
+            gauge = AngleGauge(gauge_panel, title, color, height=150)
+            gauge.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 10, 0))
+            self.gauges[key] = gauge
 
     def _scan(self):
         self.status_label.configure(text="正在扫描...")
@@ -390,8 +494,23 @@ class DualImuDashboard(tk.Tk):
     def _disconnect(self, slot):
         self.worker.disconnect(slot)
         self.connected_names[slot] = None
+        self.latest_angles[slot] = None
+        self.angle_history[slot].clear()
+        self.calibrated = False
+        self.calibration_pending = False
+        self._update_gauges()
+        self._update_calibration_label()
         self.cubes[slot].last_update = None
         self.cubes[slot].set_status("已断开", "未连接")
+
+    def _request_calibration(self):
+        if self.latest_angles["A"] is None or self.latest_angles["B"] is None:
+            messagebox.showinfo("等待数据", "请先连接两个 IMU，并等待两个立方体都开始接收数据。")
+            return
+        self.calibration_pending = True
+        self.calibrated = False
+        self.calibration_label.configure(text="校准状态：等待两个 IMU 稳定...")
+        self._try_calibrate()
 
     def _process_events(self):
         try:
@@ -416,6 +535,9 @@ class DualImuDashboard(tk.Tk):
                     messagebox.showerror("连接失败", payload)
                 elif kind == "data":
                     self.cubes[slot].update_data(payload)
+                    self._record_angles(slot, payload)
+                    self._try_calibrate()
+                    self._update_relative_angles()
                 elif kind == "status":
                     self.status_label.configure(text=payload)
         except queue.Empty:
@@ -437,7 +559,125 @@ class DualImuDashboard(tk.Tk):
     def _refresh_cubes(self):
         for cube in self.cubes.values():
             cube.refresh_age()
+        self._try_calibrate()
+        self._update_calibration_label()
         self.after(500, self._refresh_cubes)
+
+    def _record_angles(self, slot, data):
+        if slot not in self.latest_angles:
+            return
+        if any(not isinstance(data.get(key), (int, float)) for key in ANGLE_KEYS):
+            return
+        angles = {key: float(data[key]) for key in ANGLE_KEYS}
+        self.latest_angles[slot] = angles
+        self.angle_history[slot].append((time.time(), angles))
+
+    def _is_slot_stable(self, slot):
+        stable, _detail = self._slot_stability(slot)
+        return stable
+
+    def _slot_stability(self, slot):
+        history = list(self.angle_history[slot])
+        now = time.time()
+        history = [(ts, angles) for ts, angles in history if now - ts <= STABILITY_WINDOW_SECONDS]
+        detail = {
+            "samples": len(history),
+            "ranges": {key: None for key in ANGLE_KEYS},
+            "fresh": bool(history and now - history[-1][0] <= 1.0),
+        }
+        if len(history) < MIN_STABILITY_SAMPLES:
+            return False, detail
+        if now - history[-1][0] > 1.0:
+            return False, detail
+
+        for key in ANGLE_KEYS:
+            values = [angles[key] for _ts, angles in history]
+            mean = circular_mean(values)
+            max_deviation = max(abs(normalize_angle(value - mean)) for value in values)
+            angle_range = max_deviation * 2
+            detail["ranges"][key] = angle_range
+            if angle_range > STABILITY_LIMITS[key]:
+                return False, detail
+        return True, detail
+
+    def _both_stable(self):
+        return self._is_slot_stable("A") and self._is_slot_stable("B")
+
+    def _mean_angles(self, slot):
+        history = list(self.angle_history[slot])
+        now = time.time()
+        recent = [angles for ts, angles in history if now - ts <= STABILITY_WINDOW_SECONDS]
+        return {
+            key: circular_mean([angles[key] for angles in recent])
+            for key in ANGLE_KEYS
+        }
+
+    def _try_calibrate(self):
+        if not self.calibration_pending:
+            return
+        if not self._both_stable():
+            return
+
+        mean_a = self._mean_angles("A")
+        mean_b = self._mean_angles("B")
+        for key in ANGLE_KEYS:
+            self.calibration_offsets[key] = normalize_angle(mean_b[key] - mean_a[key])
+        self.calibrated = True
+        self.calibration_pending = False
+        self._update_relative_angles()
+        self.calibration_label.configure(text="校准状态：已校准，正在显示 B 相对 A 的夹角")
+
+    def _update_relative_angles(self):
+        if not self.calibrated:
+            self._update_gauges()
+            return
+        angles_a = self.latest_angles["A"]
+        angles_b = self.latest_angles["B"]
+        if angles_a is None or angles_b is None:
+            return
+        for key in ANGLE_KEYS:
+            raw_delta = normalize_angle(angles_b[key] - angles_a[key])
+            self.relative_angles[key] = normalize_angle(raw_delta - self.calibration_offsets[key])
+        self._update_gauges()
+
+    def _update_gauges(self):
+        for key, gauge in self.gauges.items():
+            gauge.update_angle(self.relative_angles[key], self.calibrated)
+
+    def _update_calibration_label(self):
+        if self.calibrated:
+            self.calibration_label.configure(text="校准状态：已校准，正在显示 B 相对 A 的夹角")
+            return
+        if self.calibration_pending:
+            stable_a, detail_a = self._slot_stability("A")
+            stable_b, detail_b = self._slot_stability("B")
+            self.calibration_label.configure(
+                text=(
+                    f"校准状态：等待稳定  "
+                    f"A:{self._format_stability(stable_a, detail_a)}  "
+                    f"B:{self._format_stability(stable_b, detail_b)}"
+                )
+            )
+            return
+        if self.latest_angles["A"] is None or self.latest_angles["B"] is None:
+            self.calibration_label.configure(text="校准状态：等待两个 IMU 连接")
+        else:
+            self.calibration_label.configure(text="校准状态：两个 IMU 已连接，可开始校准")
+
+    @staticmethod
+    def _format_stability(stable, detail):
+        if not detail["fresh"]:
+            return "无新数据"
+        ranges = detail["ranges"]
+        if any(ranges[key] is None for key in ANGLE_KEYS):
+            return f"{detail['samples']}/{MIN_STABILITY_SAMPLES}帧"
+        state = "稳" if stable else "未稳"
+        return (
+            f"{state} "
+            f"X{ranges['AngX']:.1f}° "
+            f"Y{ranges['AngY']:.1f}° "
+            f"Z{ranges['AngZ']:.1f}°"
+        )
 
     def _on_close(self):
         self.worker.stop()
