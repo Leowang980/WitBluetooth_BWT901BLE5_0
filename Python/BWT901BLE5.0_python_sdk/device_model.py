@@ -33,6 +33,7 @@ class DeviceModel:
         self.isOpen = False
         self.callback_method = callback_method
         self.deviceData = {}
+        self.TempBytes = []
 
     # region 获取设备数据 Obtain device data
     # 设置设备数据 Set device data

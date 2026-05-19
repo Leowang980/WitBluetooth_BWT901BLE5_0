@@ -1097,10 +1097,11 @@ class WitBleDashboard(tk.Tk):
             messagebox.showerror("扫描失败", payload)
             return
 
-        self.devices = [device for device in payload if device.name]
-        wt_devices = [device for device in self.devices if "WT" in (device.name or "").upper()]
-        if wt_devices:
-            self.devices = wt_devices
+        self.devices = [
+            device
+            for device in payload
+            if device.name and "WT" in device.name.upper()
+        ]
 
         self.device_tree.delete(*self.device_tree.get_children())
         for index, device in enumerate(self.devices):
